@@ -2,6 +2,7 @@
 name = "nbyte-int"
 version = "0.1.0"
 edition = "2024"
+repository = ""
 
 [dependencies]
 bytemuck = { version = "1.23.2", features = ["derive", "min_const_generics"] }

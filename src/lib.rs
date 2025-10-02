@@ -79,7 +79,7 @@ macro_rules! nbyte_int_inner {
         pastey::paste! {$(
             declare_inner_struct! {
                 [<$signed_prefix $bit_count LitteEndian Inner>] @[$size] {
-                    data: [u8; $byte_count],
+                    bytes: [u8; $byte_count],
                     zeros: [Zero; { $size - $byte_count }],
                 }
             }
@@ -87,25 +87,34 @@ macro_rules! nbyte_int_inner {
             declare_inner_struct! {
                 [<$signed_prefix $bit_count BigEndian Inner>] @[$size] {
                     zeros: [Zero; { $size - $byte_count }],
-                    data: [u8; $byte_count]
+                    bytes: [u8; $byte_count]
                 }
             }
 
+
             #[cfg(target_endian = "little")]
             type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LitteEndian Inner>];
+
             #[cfg(target_endian = "little")]
             type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
 
             #[cfg(target_endian = "big")]
             type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
+
             #[cfg(target_endian = "big")]
             type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LitteEndian Inner>];
 
-            impl [<$signed_prefix $bit_count Inner>] {
-                const BITS: u32 = ($byte_count * 8);
+
+            #[allow(non_camel_case_types)]
+            #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::NoUninit)]
+            #[repr(transparent)]
+            pub struct [<$signed_prefix:lower $bit_count>]([<$signed_prefix $bit_count Inner>]);
+
+            impl [<$signed_prefix:lower $bit_count>] {
+                pub const BITS: u32 = $bit_count;
                 const DATA_BITS_MASK: $backing = (1 << ($byte_count * 8)) - 1;
 
-                const MIN: $backing = match_signedness! {
+                const MIN_INNER: $backing = match_signedness! {
                     match $signed_prefix {
                         SIGNED => {
                             {
@@ -123,12 +132,31 @@ macro_rules! nbyte_int_inner {
                     }
                 };
 
-                const MAX: $backing = match_signedness! {
+                const MAX_INNER: $backing = match_signedness! {
                     match $signed_prefix {
                         SIGNED => { Self::DATA_BITS_MASK >> 1 },
                         UNSIGNED => { Self::DATA_BITS_MASK },
                     }
                 };
+
+                /// truncates the upper bytes and sets them to zero
+                #[inline(always)]
+                pub const fn new(bits: $backing) -> Option<Self> {
+                    if Self::MIN_INNER <= bits && bits <= Self::MAX_INNER {
+                        return Some(match_signedness! {
+                            match $signed_prefix {
+                                // the sign bit and friends may be on
+                                // mask it just in case
+                                SIGNED => { Self::new_truncated(bits) },
+                                // unsigned no need to mask the top bits
+                                // they are already off
+                                UNSIGNED => { unsafe { Self::from_bits(bits) } },
+                            }
+                        })
+                    }
+
+                    None
+                }
 
                 /// # Safety
                 #[doc = concat!(
@@ -137,7 +165,7 @@ macro_rules! nbyte_int_inner {
                     " with zeros, the upper bytes must NOT be filled"
                 )]
                 #[inline(always)]
-                pub const unsafe fn new_unchecked(bits: $backing) -> Self {
+                pub const unsafe fn from_bits(bits: $backing) -> Self {
                     // Safety: upheld by user
                     unsafe { core::mem::transmute(bits) }
                 }
@@ -146,27 +174,8 @@ macro_rules! nbyte_int_inner {
                 #[inline(always)]
                 pub const fn new_truncated(bits: $backing) -> Self {
                     unsafe {
-                        Self::new_unchecked(bits & Self::DATA_BITS_MASK)
+                        Self::from_bits(bits & Self::DATA_BITS_MASK)
                     }
-                }
-
-                /// truncates the upper bytes and sets them to zero
-                #[inline(always)]
-                pub const fn new(bits: $backing) -> Option<Self> {
-                    if Self::MIN <= bits && bits <= Self::MAX {
-                        return Some(match_signedness! {
-                            match $signed_prefix {
-                                // the sign bit and friends may be on
-                                // mask it just in case
-                                SIGNED => { Self::new_truncated(bits) },
-                                // unsigned no need to mask the top bits
-                                // they are already off
-                                UNSIGNED => { unsafe { Self::new_unchecked(bits) } },
-                            }
-                        })
-                    }
-
-                    None
                 }
 
                 #[inline(always)]
@@ -176,7 +185,7 @@ macro_rules! nbyte_int_inner {
                 }
 
                 #[inline(always)]
-                pub const fn swap_bytes(self) -> Self {
+                pub const fn swapped_bytes(self) -> [u8; $byte_count] {
                     let bits = self.to_bits();
                     let swapped = bits.swap_bytes();
 
@@ -187,13 +196,18 @@ macro_rules! nbyte_int_inner {
                     let swapped: [<Flipped $signed_prefix $bit_count Inner>] = unsafe {
                         core::mem::transmute(swapped)
                     };
+                    
+                    swapped.bytes
+                }
 
+                #[inline(always)]
+                pub const fn swap_bytes(self) -> Self {
                     // this has surprisingly very good codegen
-                    // and is way better than anything manual
-                    Self {
-                        zeros: const { [Zero::_0; { $size - $byte_count }] },
-                        data: swapped.data
-                    }
+                    // and is as good if not better than anything manual after inlining
+                    Self([<$signed_prefix $bit_count Inner>] {
+                        zeros: [Zero::_0; { $size - $byte_count }],
+                        bytes: self.swapped_bytes()
+                    })
                 }
 
                 #[inline(always)]
@@ -210,15 +224,28 @@ macro_rules! nbyte_int_inner {
                 }
 
                 #[inline(always)]
-                pub const fn to_be(self) -> Self {
+                pub const fn to_le_bytes(self) -> [u8; $byte_count] {
+                    #[cfg(target_endian = "little")]
+                    {
+                        self.0.bytes
+                    }
+
                     #[cfg(target_endian = "big")]
                     {
-                        self
+                        self.swapped_bytes()
+                    }
+                }
+
+                #[inline(always)]
+                pub const fn to_be_bytes(self) -> [u8; $byte_count] {
+                    #[cfg(target_endian = "big")]
+                    {
+                        self.0.bytes
                     }
 
                     #[cfg(target_endian = "little")]
                     {
-                        self.swap_bytes()
+                        self.swapped_bytes()
                     }
                 }
 
@@ -228,7 +255,7 @@ macro_rules! nbyte_int_inner {
                         match $signed_prefix {
                             SIGNED => {
                                 {
-                                    const OFFSET: u32 = $backing::BITS - <[<$signed_prefix $bit_count Inner>]>::BITS;
+                                    const OFFSET: u32 = $backing::BITS - <[<$signed_prefix:lower $bit_count>]>::BITS;
                                     // FIXME unchecked_shifts
                                     // this aligns the integers sign bit
                                     // to the sign bit of the backing type
@@ -242,8 +269,6 @@ macro_rules! nbyte_int_inner {
                     }
                 }
             }
-
-
         )*}
         )*
     };
