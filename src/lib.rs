@@ -1,5 +1,7 @@
 #![no_std]
 
+#![doc = include_str!("../README.md")]
+
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 #[repr(u8)]
 enum Zero {
@@ -350,29 +352,32 @@ macro_rules! nbyte_int_inner {
     (
         $($backing_ty: ident @($signed_prefix: ident $size: expr) [$($byte_count: tt @ $bit_count: tt),+])*
     ) => {
-        $(
-        const _: () = {
-            let min = $size / 2;
-            let max = size_of::<$backing_ty>();
-            assert!($size == max, "invalid backing type size");
-            $(
-            assert!(
-                $bit_count == $byte_count * 8,
-                concat!(
-                    "invalid nbyte bit count for ",
-                    stringify!($byte_count),
-                    " bytes",
-                )
-            );
-            assert!(min < $byte_count && $byte_count < max, "invalid nbyte int");
-            )*
-            let len = <[_]>::len(&[$($byte_count),*]);
-            // len = (min..max).len() - 1
-            // len = max - min - 1
-            assert!(len == max - min - 1, "not all byte integers implemented");
-        };
+        pastey::paste! {
+            pub mod types {
+                use super::*;
 
-        pastey::paste! {$(
+            $(const _: () = {
+                let min = $size / 2;
+                let max = size_of::<$backing_ty>();
+                assert!($size == max, "invalid backing type size");
+                $(
+                assert!(
+                    $bit_count == $byte_count * 8,
+                    concat!(
+                        "invalid nbyte bit count for ",
+                        stringify!($byte_count),
+                        " bytes",
+                    )
+                );
+                assert!(min < $byte_count && $byte_count < max, "invalid nbyte int");
+                )*
+                let len = <[_]>::len(&[$($byte_count),*]);
+                // len = (min..max).len() - 1
+                // len = max - min - 1
+                assert!(len == max - min - 1, "not all byte integers implemented");
+            };
+
+            $(
             declare_inner_struct! {
                 [<$signed_prefix $bit_count LitteEndian Inner>] @[$size] {
                     bytes: [u8; $byte_count],
@@ -610,18 +615,18 @@ macro_rules! nbyte_int_inner {
             }
 
             defer_impl!(@($signed_prefix) [<$signed_prefix:lower $bit_count>] as $backing_ty);
-        )*}
-
+            )*
         )*
+        }
 
 
         pub mod const_macro {
-            pastey::paste! {$($(
+            $($(
                 #[macro_export]
                 macro_rules! [<$signed_prefix:lower $bit_count>] {
                     ($__inner_expr__: expr) => {
                         const {
-                            match $crate::[<$signed_prefix:lower $bit_count>]::new($__inner_expr__) {
+                            match $crate::types::[<$signed_prefix:lower $bit_count>]::new($__inner_expr__) {
                                 Some(x) => x,
                                 None => panic!(
                                     concat!("invalid number constant")
@@ -632,7 +637,8 @@ macro_rules! nbyte_int_inner {
                 }
 
                 pub use [<$signed_prefix:lower $bit_count>];
-            )*)*}
+            )*)*
+        }
         }
     };
 }
@@ -647,6 +653,11 @@ macro_rules! nbyte_int {
                 [<i $backing>] @(I $size) [$($byte_count @ $bit_count),+]
                 [<u $backing>] @(U $size) [$($byte_count @ $bit_count),+]
                 )*
+            }
+
+            pub mod prelude {
+                pub use $crate::types::*;
+                pub use $crate::const_macro::*;
             }
         }
     };

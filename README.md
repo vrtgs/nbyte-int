@@ -11,7 +11,7 @@
 Every type has a corresponding constant macro:
 
 ```rust
-use nbyte_int::const_macro::*;
+use nbyte_int::prelude::*;
 
 const A: u40 = u40!(123456789012);
 const B: i24 = i24!(-1024);
