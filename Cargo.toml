@@ -1,17 +1,18 @@
 [package]
 name = "nbyte-int"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 repository = "https://github.com/vrtgs/nbyte-int"
 license = "MIT OR Apache-2.0"
 description = "any byte sized increment of a number"
 
 [features]
-default = ["num-traits"]
+default = []
 
 [dependencies]
 bytemuck = { version = "1.23.2", optional = true }
 num-traits = { version = "0.2.19", optional = true }
+serde = { version = "1.0.228", optional = true }
 pastey = "0.1.1"
 
 

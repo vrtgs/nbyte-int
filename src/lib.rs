@@ -236,6 +236,68 @@ macro_rules! defer_impl {
             impl Div, div for $ty as $inner
             impl Rem, rem for $ty as $inner
         }
+        
+        impl $ty {
+            pub const fn from_str_radix(str: &str, radix: u32) -> Result<Self, core::num::ParseIntError> {
+                match <$inner>::from_str_radix(str, radix) {
+                    Err(err) => Err(err),
+                    Ok(int) => match Self::new(int) {
+                        Some(casted_int) => Ok(casted_int),
+                        // for unsigned integers this obviously gets optimized out
+                        #[allow(unused_comparisons)]
+                        None if int < 0 => Err(NEGATIVE_OVERFLOW),
+                        None => Err(POSITIVE_OVERFLOW)
+                    }
+                }
+            }
+        }
+        
+        impl core::str::FromStr for $ty {
+            type Err = core::num::ParseIntError;
+            
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::from_str_radix(s, 10)
+            }
+        }
+        
+        
+        
+        #[cfg(feature = "serde")]
+        impl serde::Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                match serializer.is_human_readable() {
+                    true => <$inner as serde::Serialize>::serialize(&self.get(), serializer),
+                    false => <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Serialize>::serialize(&self.to_be_bytes(), serializer)
+                }
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                match deserializer.is_human_readable() {
+                    true => {
+                        let int = <$inner as serde::Deserialize>::deserialize(deserializer)?;
+                        match $ty::new(int) {
+                            Some(int) => Ok(int),
+                            None => Err(<D::Error as serde::de::Error>::custom(
+                                format_args!("invalid {int} as {}", stringify!(i24))
+                            )),
+                        }
+                    },
+                    false => {
+                        <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Deserialize>::deserialize(deserializer)
+                            .map(<$ty>::from_be_bytes)
+                    }
+                }
+            }
+    }
 
         #[cfg(feature = "num-traits")]
         impl num_traits::One for $ty {
@@ -278,19 +340,9 @@ macro_rules! defer_impl {
             type FromStrRadixErr = core::num::ParseIntError;
 
             fn from_str_radix(str: &str, radix: u32) -> Result<Self, Self::FromStrRadixErr> {
-                <$inner>::from_str_radix(str, radix).and_then(|int| {
-                    match Self::new(int) {
-                        Some(casted_int) => Ok(casted_int),
-                        // for unsigned integers this obviously gets optimized out
-                        #[allow(unused_comparisons)]
-                        None if int < 0 => Err(NEGATIVE_OVERFLOW),
-                        None => Err(POSITIVE_OVERFLOW)
-                    }
-                })
+                Self::from_str_radix(str, radix)
             }
         }
-
-
     };
 }
 
@@ -458,10 +510,7 @@ macro_rules! nbyte_int_inner {
                 pub const fn swap_bytes(self) -> Self {
                     // this has surprisingly very good codegen
                     // and is as good if not better than anything manual after inlining
-                    Self([<$signed_prefix $bit_count Inner>] {
-                        zeros: [Zero::_0; { $size - $byte_count }],
-                        bytes: self.swapped_bytes()
-                    })
+                    Self::from_ne_bytes(self.swapped_bytes())
                 }
 
                 #[inline(always)]
@@ -475,6 +524,37 @@ macro_rules! nbyte_int_inner {
                     {
                         self.swap_bytes()
                     }
+                }
+
+                #[inline(always)]
+                pub const fn to_be(self) -> Self {
+                    #[cfg(target_endian = "big")]
+                    {
+                        self
+                    }
+
+                    #[cfg(target_endian = "little")]
+                    {
+                        self.swap_bytes()
+                    }
+                }
+
+                #[inline(always)]
+                pub const fn from_ne_bytes(bytes: [u8; $byte_count]) -> Self {
+                    Self([<$signed_prefix $bit_count Inner>]{
+                        zeros: [Zero::_0; { $size - $byte_count }],
+                        bytes
+                    })
+                }
+
+                #[inline(always)]
+                pub const fn from_le_bytes(bytes: [u8; $byte_count]) -> Self {
+                    Self::from_ne_bytes(bytes).to_le()
+                }
+
+                #[inline(always)]
+                pub const fn from_be_bytes(bytes: [u8; $byte_count]) -> Self {
+                    Self::from_ne_bytes(bytes).to_be()
                 }
 
                 #[inline(always)]
