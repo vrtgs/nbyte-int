@@ -6,6 +6,13 @@ repository = "https://github.com/vrtgs/nbyte-int"
 license = "MIT OR Apache-2.0"
 description = "any byte sized increment of a number"
 
+[features]
+default = ["num-traits"]
+
 [dependencies]
-bytemuck = { version = "1.23.2", features = ["derive", "min_const_generics"] }
+bytemuck = { version = "1.23.2", optional = true }
+num-traits = { version = "0.2.19", optional = true }
 pastey = "0.1.1"
+
+
+[dev-dependencies]

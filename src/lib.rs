@@ -1,11 +1,29 @@
 #![no_std]
 
-
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, bytemuck::Zeroable, bytemuck::NoUninit)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 #[repr(u8)]
 enum Zero {
     _0 = 0
 }
+
+
+const fn from_str_error(bad_val: &str) -> core::num::ParseIntError {
+    match i8::from_str_radix(bad_val, 10) {
+        Err(err) => err,
+        Ok(_) => unreachable!(),
+    }
+}
+
+const POSITIVE_OVERFLOW: core::num::ParseIntError = from_str_error("9999999999999999999999999999999999999999");
+
+const NEGATIVE_OVERFLOW: core::num::ParseIntError = from_str_error("-9999999999999999999999999999999999999999");
+
+#[cfg(feature = "bytemuck")]
+unsafe impl bytemuck::Zeroable for Zero {}
+
+#[cfg(feature = "bytemuck")]
+unsafe impl bytemuck::NoUninit for Zero {}
+
 
 #[cfg(all(target_endian = "big", target_endian = "little"))]
 compile_error!("invalid endianness");
@@ -16,19 +34,20 @@ compile_error!("unknown endianness");
 
 macro_rules! declare_inner_struct {
     ($name: ident @[$size: expr] { $($fields: tt)* }) => {
-        #[derive(Copy, Clone, bytemuck::Zeroable)]
+        #[derive(Copy, Clone)]
         #[repr(C, align($size))]
         struct $name {
             $($fields)*
         }
 
-        // Safety: all fields are NoUninit and there is no padding
+        // Safety: all fields are NoUninit and Zeroable and there is no padding
+        // there is no padding as that is statically asserted
+        // and they are NoUninit and Zeroable since all the fields are either `u8` or `Zero`
+        #[cfg(feature = "bytemuck")]
         unsafe impl bytemuck::NoUninit for $name {}
+        #[cfg(feature = "bytemuck")]
+        unsafe impl bytemuck::Zeroable for $name {}
 
-        const _: () = {
-            const fn assert_impl<T: ::bytemuck::NoUninit>() {}
-            assert_impl::<Zero>();
-        };
 
         const _: () = assert!(size_of::<$name>() == $size);
     };
@@ -50,14 +69,239 @@ macro_rules! match_signedness {
     };
 }
 
+
+macro_rules! forward_ref_op_assign {
+    (impl $imp:ident, $method:ident for $t:ty) => {
+        impl core::ops::$imp<&$t> for $t {
+            #[inline(always)]
+            fn $method(&mut self, other: &$t) {
+                core::ops::$imp::$method(self, *other);
+            }
+        }
+    }
+}
+
+macro_rules! forward_ref_binop {
+    (impl $imp:ident, $method:ident for $t:ty) => {
+        impl core::ops::$imp<$t> for &$t {
+            type Output = <$t as core::ops::$imp<$t>>::Output;
+
+            #[inline(always)]
+            fn $method(self, other: $t) -> Self::Output {
+                core::ops::$imp::$method(*self, other)
+            }
+        }
+
+        impl core::ops::$imp<&$t> for $t {
+            type Output = <$t as core::ops::$imp<$t>>::Output;
+
+            #[inline(always)]
+            fn $method(self, other: &$t) -> Self::Output {
+                core::ops::$imp::$method(self, *other)
+            }
+        }
+
+        impl core::ops::$imp<&$t> for &$t {
+            type Output = <$t as core::ops::$imp<$t>>::Output;
+
+            #[inline(always)]
+            fn $method(self, other: &$t) -> Self::Output {
+                core::ops::$imp::$method(*self, *other)
+            }
+        }
+    }
+}
+
+
+macro_rules! impl_wrapping_binop_inner {
+    ($(impl $imp:ident, $method:ident for ($ty:ty as $inner: ty) @ $fetch:ident)+) => {$(
+        impl core::ops::$imp for $ty {
+            type Output = $ty;
+
+            #[inline(always)]
+            fn $method(self, rhs: Self) -> Self::Output {
+                let lhs = self.$fetch();
+                let rhs = rhs.$fetch();
+                let result = pastey::paste!(<$inner>::[<wrapping_ $method>](lhs, rhs));
+                Self::new_truncated(result)
+            }
+        }
+
+        forward_ref_binop! { impl $imp, $method for $ty }
+
+        pastey::paste! {
+            impl core::ops::[<$imp Assign>] for $ty {
+                #[inline(always)]
+                fn [<$method _assign>](&mut self, rhs: Self) {
+                    *self = <Self as core::ops::$imp>::$method(*self, rhs);
+                }
+            }
+
+            forward_ref_op_assign! { impl [<$imp Assign>], [<$method _assign>] for $ty }
+        }
+    )+}
+}
+
+macro_rules! impl_wrapping_bits_binop {
+    ($(impl $imp:ident, $method:ident for $t:ty as $inner: ty)+) => {$(
+        impl_wrapping_binop_inner! { impl $imp, $method for ($t as $inner) @ to_bits }
+    )+}
+}
+
+macro_rules! impl_wrapping_inner_binop {
+    ($(impl $imp:ident, $method:ident for $t:ty as $inner: ty)+) => {$(
+        impl_wrapping_binop_inner! { impl $imp, $method for ($t as $inner) @ get }
+    )+}
+}
+
+macro_rules! handle_argument {
+    ($arg_name: ident : Self) => { $arg_name.get() };
+    ($arg_name: ident : &Self) => { &$arg_name.get() };
+    ($arg_name: ident : &mut Self) => { &mut $arg_name.get() };
+    ($arg_name: ident : $arg_ty: ty) => { $arg_name };
+}
+
+macro_rules! defer_basic {
+    (
+        $(impl ($path: path) for $ty: ident as $inner: ty {
+            $(fn $method: ident ($(& $([$has_ref: tt])? $(mut $([$has_mut: tt])? )?)? self $(, $arg_name: ident : [$($arg_ty: tt)*])* $(,)?) -> $ret: ty;)*
+        })*
+    ) => {$(
+        impl $path for $ty {
+            $(#[inline(always)]
+            fn $method($(& $($has_ref)? $(mut $($has_mut)? )?)? self $(, $arg_name : $($arg_ty)*)*) -> $ret {
+                <$inner as $path>::$method($(& $($has_ref)? $(mut $($has_mut)? )?)? self.get() $(, handle_argument!($arg_name: $($arg_ty)*))*)
+            })*
+        }
+    )*};
+}
+
+macro_rules! defer_impl {
+    (@($sign_prefix: ident) $ty: ident as $inner: ty) => {
+        defer_basic! {
+            impl (core::fmt::Display) for $ty as $inner {
+                fn fmt(&self, f: [&mut core::fmt::Formatter<'_>]) -> core::fmt::Result;
+            }
+
+            impl (core::fmt::Debug) for $ty as $inner {
+                fn fmt(&self, f: [&mut core::fmt::Formatter<'_>]) -> core::fmt::Result;
+            }
+
+            impl (core::cmp::PartialEq) for $ty as $inner {
+                fn eq(&self, other: [&Self]) -> bool;
+                fn ne(&self, other: [&Self]) -> bool;
+            }
+
+            impl (core::cmp::Eq) for $ty as $inner {}
+
+
+            impl (core::cmp::PartialOrd) for $ty as $inner {
+                fn partial_cmp(&self, other: [&Self]) -> Option<core::cmp::Ordering>;
+
+
+                fn lt(&self, other: [&Self]) -> bool;
+                fn le(&self, other: [&Self]) -> bool;
+
+                fn gt(&self, other: [&Self]) -> bool;
+                fn ge(&self, other: [&Self]) -> bool;
+            }
+
+            impl (core::cmp::Ord) for $ty as $inner {
+                fn cmp(&self, other: [&Self]) -> core::cmp::Ordering;
+            }
+        }
+
+        impl core::hash::Hash for $ty {
+            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+                <$inner as core::hash::Hash>::hash(&self.get(), state)
+            }
+
+            fn hash_slice<H: core::hash::Hasher>(data: &[Self], state: &mut H) where Self: Sized {
+                <$inner as core::hash::Hash>::hash_slice(
+                    // $ty has the same layout and abi and everything as $inner
+                    // its inner with some restrictions so this is fine
+                    unsafe { &*(data as *const [Self] as *const [$inner]) },
+                    state
+                )
+            }
+        }
+
+        impl_wrapping_bits_binop! {
+            impl Add, add for $ty as $inner
+            impl Sub, sub for $ty as $inner
+            impl Mul, mul for $ty as $inner
+        }
+
+        impl_wrapping_inner_binop! {
+            impl Div, div for $ty as $inner
+            impl Rem, rem for $ty as $inner
+        }
+
+        #[cfg(feature = "num-traits")]
+        impl num_traits::One for $ty {
+            #[inline(always)]
+            fn one() -> Self {
+                <Self as num_traits::ConstOne>::ONE
+            }
+
+            #[inline]
+            fn is_one(&self) -> bool {
+                *self == <Self as num_traits::ConstOne>::ONE
+            }
+        }
+
+        #[cfg(feature = "num-traits")]
+        impl num_traits::ConstOne for $ty {
+            const ONE: Self = const_macro::$ty!(1);
+        }
+
+        #[cfg(feature = "num-traits")]
+        impl num_traits::Zero for $ty {
+            #[inline(always)]
+            fn zero() -> Self {
+                <Self as num_traits::ConstZero>::ZERO
+            }
+
+            #[inline(always)]
+            fn is_zero(&self) -> bool {
+                *self == <Self as num_traits::ConstZero>::ZERO
+            }
+        }
+
+        #[cfg(feature = "num-traits")]
+        impl num_traits::ConstZero for $ty {
+            const ZERO: Self = const_macro::$ty!(0);
+        }
+
+        #[cfg(feature = "num-traits")]
+        impl num_traits::Num for $ty {
+            type FromStrRadixErr = core::num::ParseIntError;
+
+            fn from_str_radix(str: &str, radix: u32) -> Result<Self, Self::FromStrRadixErr> {
+                <$inner>::from_str_radix(str, radix).and_then(|int| {
+                    match Self::new(int) {
+                        Some(casted_int) => Ok(casted_int),
+                        // for unsigned integers this obviously gets optimized out
+                        #[allow(unused_comparisons)]
+                        None if int < 0 => Err(NEGATIVE_OVERFLOW),
+                        None => Err(POSITIVE_OVERFLOW)
+                    }
+                })
+            }
+        }
+
+
+    };
+}
+
 macro_rules! nbyte_int_inner {
     (
-        $($backing: ident @($signed_prefix: ident $size: expr) [$($byte_count: tt @ $bit_count: tt),+])*
+        $($backing_ty: ident @($signed_prefix: ident $size: expr) [$($byte_count: tt @ $bit_count: tt),+])*
     ) => {
         $(
         const _: () = {
             let min = $size / 2;
-            let max = size_of::<$backing>();
+            let max = size_of::<$backing_ty>();
             assert!($size == max, "invalid backing type size");
             $(
             assert!(
@@ -106,15 +350,20 @@ macro_rules! nbyte_int_inner {
 
 
             #[allow(non_camel_case_types)]
-            #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::NoUninit)]
+            #[derive(Copy, Clone)]
             #[repr(transparent)]
             pub struct [<$signed_prefix:lower $bit_count>]([<$signed_prefix $bit_count Inner>]);
 
-            impl [<$signed_prefix:lower $bit_count>] {
-                pub const BITS: u32 = $bit_count;
-                const DATA_BITS_MASK: $backing = (1 << ($byte_count * 8)) - 1;
+            // Safety: the inner type is also both NoUninit and Zeroable
+            #[cfg(feature = "bytemuck")]
+            unsafe impl bytemuck::NoUninit for [<$signed_prefix:lower $bit_count>] {}
+            #[cfg(feature = "bytemuck")]
+            unsafe impl bytemuck::Zeroable for [<$signed_prefix:lower $bit_count>] {}
 
-                const MIN_INNER: $backing = match_signedness! {
+            impl [<$signed_prefix:lower $bit_count>] {
+                const DATA_BITS_MASK: $backing_ty = (1 << ($byte_count * 8)) - 1;
+
+                const MIN_INNER: $backing_ty = match_signedness! {
                     match $signed_prefix {
                         SIGNED => {
                             {
@@ -132,16 +381,21 @@ macro_rules! nbyte_int_inner {
                     }
                 };
 
-                const MAX_INNER: $backing = match_signedness! {
+                const MAX_INNER: $backing_ty = match_signedness! {
                     match $signed_prefix {
                         SIGNED => { Self::DATA_BITS_MASK >> 1 },
                         UNSIGNED => { Self::DATA_BITS_MASK },
                     }
                 };
 
+
+                pub const BITS: u32 = $bit_count;
+                pub const MIN: Self = Self::new(Self::MIN_INNER).unwrap();
+                pub const MAX: Self = Self::new(Self::MAX_INNER).unwrap();
+
                 /// truncates the upper bytes and sets them to zero
                 #[inline(always)]
-                pub const fn new(bits: $backing) -> Option<Self> {
+                pub const fn new(bits: $backing_ty) -> Option<Self> {
                     if Self::MIN_INNER <= bits && bits <= Self::MAX_INNER {
                         return Some(match_signedness! {
                             match $signed_prefix {
@@ -165,21 +419,21 @@ macro_rules! nbyte_int_inner {
                     " with zeros, the upper bytes must NOT be filled"
                 )]
                 #[inline(always)]
-                pub const unsafe fn from_bits(bits: $backing) -> Self {
+                pub const unsafe fn from_bits(bits: $backing_ty) -> Self {
                     // Safety: upheld by user
                     unsafe { core::mem::transmute(bits) }
                 }
 
                 /// truncates the upper bytes and sets them to zero
                 #[inline(always)]
-                pub const fn new_truncated(bits: $backing) -> Self {
+                pub const fn new_truncated(bits: $backing_ty) -> Self {
                     unsafe {
                         Self::from_bits(bits & Self::DATA_BITS_MASK)
                     }
                 }
 
                 #[inline(always)]
-                pub const fn to_bits(self) -> $backing {
+                pub const fn to_bits(self) -> $backing_ty {
                     // Safety: self is always in the same layout as backing
                     unsafe { core::mem::transmute(self) }
                 }
@@ -224,6 +478,11 @@ macro_rules! nbyte_int_inner {
                 }
 
                 #[inline(always)]
+                pub const fn to_ne_bytes(self) -> [u8; $byte_count] {
+                    self.0.bytes
+                }
+
+                #[inline(always)]
                 pub const fn to_le_bytes(self) -> [u8; $byte_count] {
                     #[cfg(target_endian = "little")]
                     {
@@ -250,12 +509,12 @@ macro_rules! nbyte_int_inner {
                 }
 
                 #[inline(always)]
-                pub const fn get(self) -> $backing {
+                pub const fn get(self) -> $backing_ty {
                     match_signedness! {
                         match $signed_prefix {
                             SIGNED => {
                                 {
-                                    const OFFSET: u32 = $backing::BITS - <[<$signed_prefix:lower $bit_count>]>::BITS;
+                                    const OFFSET: u32 = $backing_ty::BITS - <[<$signed_prefix:lower $bit_count>]>::BITS;
                                     // FIXME unchecked_shifts
                                     // this aligns the integers sign bit
                                     // to the sign bit of the backing type
@@ -269,8 +528,32 @@ macro_rules! nbyte_int_inner {
                     }
                 }
             }
+
+            defer_impl!(@($signed_prefix) [<$signed_prefix:lower $bit_count>] as $backing_ty);
         )*}
+
         )*
+
+
+        pub mod const_macro {
+            pastey::paste! {$($(
+                #[macro_export]
+                macro_rules! [<$signed_prefix:lower $bit_count>] {
+                    ($__inner_expr__: expr) => {
+                        const {
+                            match $crate::[<$signed_prefix:lower $bit_count>]::new($__inner_expr__) {
+                                Some(x) => x,
+                                None => panic!(
+                                    concat!("invalid number constant")
+                                )
+                            }
+                        }
+                    }
+                }
+
+                pub use [<$signed_prefix:lower $bit_count>];
+            )*)*}
+        }
     };
 }
 
