@@ -1,8 +1,10 @@
 [package]
 name = "nbyte-int"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
-repository = ""
+repository = "https://github.com/vrtgs/nbyte-int"
+license = "MIT OR Apache-2.0"
+description = "any byte sized increment of a number"
 
 [dependencies]
 bytemuck = { version = "1.23.2", features = ["derive", "min_const_generics"] }
