@@ -382,7 +382,64 @@ macro_rules! nbyte_int_inner {
     ) => {
         pastey::paste! {
             pub mod types {
-                use super::*;
+            //! The integer types: `i24`, `i40`, `i48`, `i56`, `i72` through `i120`, and
+            //! the unsigned equivalents `u24`, `u40`, ... `u120`.
+            //!
+            //! Each type is a fixed-width integer whose width is a whole number of bytes
+            //! but not one of the native widths (8, 16, 32, 64 or 128 bits). For those,
+            //! use the primitive types.
+            //!
+            //! # Layout
+            //!
+            //! Every type has the same size and alignment as the primitive that backs it
+            //! (`i24` and `u24` use `i32` and `u32`; `i40` through `i56` use 64-bit
+            //! integers; `i72` through `i120` use 128-bit integers). The unused upper
+            //! bytes are always zero. That leaves invalid bit patterns, so
+            //! `Option<i24>` is **usually** the same size as `i24`.
+            //!
+            //! # Creating values
+            //!
+            //! - [`new`](i24::new): checked, returns `None` if the value doesn't fit
+            //! - `new_truncated`: wraps like an `as` cast, never fails
+            //! - `new_unchecked`: `unsafe`, for values already known to be in range
+            //! - `from_bits`: `unsafe`, takes the raw, pre-masked bit pattern
+            //! - the constant macros in [`literal`](crate::literal): checked at
+            //!   compile time
+            //!
+            //! `get` returns the value in the backing type, sign-extended for signed
+            //! types. `to_bits` returns the raw, unextended pattern.
+            //!
+            //! # Conversions
+            //!
+            //! Every integer type in this crate, including the primitives, converts to
+            //! every other. Conversions that can never fail implement [`From`]; the rest
+            //! implement [`TryFrom`] with [`TryFromIntError`](core::num::TryFromIntError).
+            //!
+            //! # Examples
+            //!
+            //! ```
+            //! use nbyte_int::prelude::*;
+            //!
+            //! let x = i24::new(-5).unwrap();
+            //! assert_eq!(x.get(), -5);
+            //!
+            //! // out of range
+            //! assert!(i24::new(i32::MAX).is_none());
+            //! assert_eq!(i24::MAX.get(), 8_388_607);
+            //!
+            //! // same size as the backing type, and Option is free (usually - not a guarantee)
+            //! assert_eq!(size_of::<i24>(), size_of::<i32>());
+            //! assert_eq!(size_of::<Option<u40>>(), size_of::<u40>());
+            //!
+            //! // lossless conversions use `From`, the rest `TryFrom`
+            //! assert_eq!(i24::from(100_i16).get(), 100);
+            //! assert!(u24::try_from(-1_i32).is_err());
+            //! assert_eq!(u24::try_from(70_000_i64).unwrap().get(), 70_000);
+            //!
+            //! // byte order
+            //! assert_eq!(u24::new(0x010203).unwrap().to_le_bytes(), [0x03, 0x02, 0x01]);
+            //! ```
+            use super::*;
 
             $(const _: () = {
                 let min = $size / 2;
@@ -751,8 +808,8 @@ macro_rules! nbyte_int_inner {
         }
 
 
-        pub mod const_macro {
-            //! Compile-time checked constructors, one macro per type (`i24!`, `u40!`, ...).
+        pub mod literal {
+            //! Compile-time checked literal constructors, one macro per type (`i24!`, `u40!`, ...).
             //!
             //! They live here instead of the crate root so they don't clutter it.
 
@@ -812,11 +869,6 @@ macro_rules! nbyte_int {
                 [<u $backing>] @(U $size) [$($byte_count @ $bit_count),+]
                 )*
             }
-
-            pub mod prelude {
-                pub use $crate::types::*;
-                pub use $crate::const_macro::*;
-            }
         }
     };
 }
@@ -826,4 +878,14 @@ nbyte_int! {
     32 @(4) [3 @ 24]
     64 @(8) [5 @ 40, 6 @ 48, 7 @ 56]
     128 @(16) [9 @ 72, 10 @ 80, 11 @ 88, 12 @ 96, 13 @ 104, 14 @ 112, 15 @ 120]
+}
+
+pub mod prelude {
+    //! Everything you normally need, in one import.
+    //!
+    //! This re-exports all the integer types from [`types`](crate::types) and
+    //! the compile-time literal macros from [`literal`](crate::literal).
+
+    pub use crate::literal::*;
+    pub use crate::types::*;
 }

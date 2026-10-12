@@ -2,7 +2,7 @@
 
 
 # Features
-* Option<nbyte_int> is the same size as nbyte_int
+* Option<nbyte_int> is the same size as nbyte_int (usually - not guaranteed)
 * it has all byte variants of integers what else do you want?
 * a constant macro
 
