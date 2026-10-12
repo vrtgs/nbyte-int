@@ -1,13 +1,18 @@
 #![no_std]
-
 #![doc = include_str!("../README.md")]
+#![allow(
+    clippy::partialeq_ne_impl,
+    clippy::non_canonical_partial_ord_impl,
+    reason = "bulk forwarding to integer methods is faster than handwriting the methods"
+)]
+
+mod conversions;
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 #[repr(u8)]
 enum Zero {
-    _0 = 0
+    _0 = 0,
 }
-
 
 const fn from_str_error(bad_val: &str) -> core::num::ParseIntError {
     match i8::from_str_radix(bad_val, 10) {
@@ -16,9 +21,9 @@ const fn from_str_error(bad_val: &str) -> core::num::ParseIntError {
     }
 }
 
-const POSITIVE_OVERFLOW: core::num::ParseIntError = from_str_error("9999999999999999999999999999999999999999");
+const POSITIVE_OVERFLOW: core::num::ParseIntError = from_str_error("999");
 
-const NEGATIVE_OVERFLOW: core::num::ParseIntError = from_str_error("-9999999999999999999999999999999999999999");
+const NEGATIVE_OVERFLOW: core::num::ParseIntError = from_str_error("-999");
 
 #[cfg(feature = "bytemuck")]
 unsafe impl bytemuck::Zeroable for Zero {}
@@ -26,13 +31,11 @@ unsafe impl bytemuck::Zeroable for Zero {}
 #[cfg(feature = "bytemuck")]
 unsafe impl bytemuck::NoUninit for Zero {}
 
-
-#[cfg(all(target_endian = "big", target_endian = "little"))]
-compile_error!("invalid endianness");
-
-#[cfg(all(not(target_endian = "big"), not(target_endian = "little")))]
-compile_error!("unknown endianness");
-
+const _: () = match (cfg!(target_endian = "big"), cfg!(target_endian = "little")) {
+    (true, false) | (false, true) => {}
+    (false, false) => panic!("unknown endianness"),
+    (true, true) => panic!("invalid endianness"),
+};
 
 macro_rules! declare_inner_struct {
     ($name: ident @[$size: expr] { $($fields: tt)* }) => {
@@ -43,7 +46,7 @@ macro_rules! declare_inner_struct {
         }
 
         // Safety: all fields are NoUninit and Zeroable and there is no padding
-        // there is no padding as that is statically asserted
+        // there is no padding as that is statically asserted,
         // and they are NoUninit and Zeroable since all the fields are either `u8` or `Zero`
         #[cfg(feature = "bytemuck")]
         unsafe impl bytemuck::NoUninit for $name {}
@@ -71,7 +74,6 @@ macro_rules! match_signedness {
     };
 }
 
-
 macro_rules! forward_ref_op_assign {
     (impl $imp:ident, $method:ident for $t:ty) => {
         impl core::ops::$imp<&$t> for $t {
@@ -80,7 +82,7 @@ macro_rules! forward_ref_op_assign {
                 core::ops::$imp::$method(self, *other);
             }
         }
-    }
+    };
 }
 
 macro_rules! forward_ref_binop {
@@ -111,9 +113,8 @@ macro_rules! forward_ref_binop {
                 core::ops::$imp::$method(*self, *other)
             }
         }
-    }
+    };
 }
-
 
 macro_rules! impl_wrapping_binop_inner {
     ($(impl $imp:ident, $method:ident for ($ty:ty as $inner: ty) @ $fetch:ident)+) => {$(
@@ -157,20 +158,32 @@ macro_rules! impl_wrapping_inner_binop {
 }
 
 macro_rules! handle_argument {
-    ($arg_name: ident : Self) => { $arg_name.get() };
-    ($arg_name: ident : &Self) => { &$arg_name.get() };
-    ($arg_name: ident : &mut Self) => { &mut $arg_name.get() };
-    ($arg_name: ident : $arg_ty: ty) => { $arg_name };
+    ($arg_name: ident : Self) => {
+        $arg_name.get()
+    };
+    ($arg_name: ident : &Self) => {
+        &$arg_name.get()
+    };
+    ($arg_name: ident : &mut Self) => {
+        &mut $arg_name.get()
+    };
+    ($arg_name: ident : $arg_ty: ty) => {
+        $arg_name
+    };
 }
 
 macro_rules! defer_basic {
     (
         $(impl ($path: path) for $ty: ident as $inner: ty {
-            $(fn $method: ident ($(& $([$has_ref: tt])? $(mut $([$has_mut: tt])? )?)? self $(, $arg_name: ident : [$($arg_ty: tt)*])* $(,)?) -> $ret: ty;)*
+            $(
+            $(#[$meta: meta])*
+            fn $method: ident ($(& $([$has_ref: tt])? $(mut $([$has_mut: tt])? )?)? self $(, $arg_name: ident : [$($arg_ty: tt)*])* $(,)?) -> $ret: ty;
+            )*
         })*
     ) => {$(
         impl $path for $ty {
             $(#[inline(always)]
+            $(#[$meta])*
             fn $method($(& $($has_ref)? $(mut $($has_mut)? )?)? self $(, $arg_name : $($arg_ty)*)*) -> $ret {
                 <$inner as $path>::$method($(& $($has_ref)? $(mut $($has_mut)? )?)? self.get() $(, handle_argument!($arg_name: $($arg_ty)*))*)
             })*
@@ -179,7 +192,7 @@ macro_rules! defer_basic {
 }
 
 macro_rules! defer_impl {
-    (@($sign_prefix: ident) $ty: ident as $inner: ty) => {
+    (@($_sign_prefix: ident) $ty: ident as $inner: ty) => {
         defer_basic! {
             impl (core::fmt::Display) for $ty as $inner {
                 fn fmt(&self, f: [&mut core::fmt::Formatter<'_>]) -> core::fmt::Result;
@@ -191,6 +204,7 @@ macro_rules! defer_impl {
 
             impl (core::cmp::PartialEq) for $ty as $inner {
                 fn eq(&self, other: [&Self]) -> bool;
+
                 fn ne(&self, other: [&Self]) -> bool;
             }
 
@@ -215,15 +229,22 @@ macro_rules! defer_impl {
 
         impl core::hash::Hash for $ty {
             fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-                <$inner as core::hash::Hash>::hash(&self.get(), state)
+                <$inner as core::hash::Hash>::hash(
+                    // Safety: self is always in the same layout as backing
+                    unsafe { &*(self as *const Self as *const $inner) },
+                    state,
+                )
             }
 
-            fn hash_slice<H: core::hash::Hasher>(data: &[Self], state: &mut H) where Self: Sized {
+            fn hash_slice<H: core::hash::Hasher>(data: &[Self], state: &mut H)
+            where
+                Self: Sized,
+            {
                 <$inner as core::hash::Hash>::hash_slice(
-                    // $ty has the same layout and abi and everything as $inner
+                    // $ty has the same layout and everything as $inner
                     // its inner with some restrictions so this is fine
                     unsafe { &*(data as *const [Self] as *const [$inner]) },
-                    state
+                    state,
                 )
             }
         }
@@ -238,9 +259,12 @@ macro_rules! defer_impl {
             impl Div, div for $ty as $inner
             impl Rem, rem for $ty as $inner
         }
-        
+
         impl $ty {
-            pub const fn from_str_radix(str: &str, radix: u32) -> Result<Self, core::num::ParseIntError> {
+            pub const fn from_str_radix(
+                str: &str,
+                radix: u32,
+            ) -> Result<Self, core::num::ParseIntError> {
                 match <$inner>::from_str_radix(str, radix) {
                     Err(err) => Err(err),
                     Ok(int) => match Self::new(int) {
@@ -248,22 +272,20 @@ macro_rules! defer_impl {
                         // for unsigned integers this obviously gets optimized out
                         #[allow(unused_comparisons)]
                         None if int < 0 => Err(NEGATIVE_OVERFLOW),
-                        None => Err(POSITIVE_OVERFLOW)
-                    }
+                        None => Err(POSITIVE_OVERFLOW),
+                    },
                 }
             }
         }
-        
+
         impl core::str::FromStr for $ty {
             type Err = core::num::ParseIntError;
-            
+
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 Self::from_str_radix(s, 10)
             }
         }
-        
-        
-        
+
         #[cfg(feature = "serde")]
         impl serde::Serialize for $ty {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -272,7 +294,10 @@ macro_rules! defer_impl {
             {
                 match serializer.is_human_readable() {
                     true => <$inner as serde::Serialize>::serialize(&self.get(), serializer),
-                    false => <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Serialize>::serialize(&self.to_be_bytes(), serializer)
+                    false => <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Serialize>::serialize(
+                        &self.to_be_bytes(),
+                        serializer,
+                    ),
                 }
             }
         }
@@ -288,18 +313,21 @@ macro_rules! defer_impl {
                         let int = <$inner as serde::Deserialize>::deserialize(deserializer)?;
                         match $ty::new(int) {
                             Some(int) => Ok(int),
-                            None => Err(<D::Error as serde::de::Error>::custom(
-                                format_args!("invalid {int} as {}", stringify!(i24))
-                            )),
+                            None => Err(<D::Error as serde::de::Error>::custom(format_args!(
+                                "invalid {int} as {}",
+                                stringify!($ty)
+                            ))),
                         }
-                    },
+                    }
                     false => {
-                        <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Deserialize>::deserialize(deserializer)
-                            .map(<$ty>::from_be_bytes)
+                        <[u8; { (<$ty>::BITS / 8) as usize }] as serde::Deserialize>::deserialize(
+                            deserializer,
+                        )
+                        .map(<$ty>::from_be_bytes)
                     }
                 }
             }
-    }
+        }
 
         #[cfg(feature = "num-traits")]
         impl num_traits::One for $ty {
@@ -379,7 +407,7 @@ macro_rules! nbyte_int_inner {
 
             $(
             declare_inner_struct! {
-                [<$signed_prefix $bit_count LitteEndian Inner>] @[$size] {
+                [<$signed_prefix $bit_count LittleEndian Inner>] @[$size] {
                     bytes: [u8; $byte_count],
                     zeros: [Zero; { $size - $byte_count }],
                 }
@@ -393,17 +421,16 @@ macro_rules! nbyte_int_inner {
             }
 
 
-            #[cfg(target_endian = "little")]
-            type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LitteEndian Inner>];
-
-            #[cfg(target_endian = "little")]
-            type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
-
-            #[cfg(target_endian = "big")]
-            type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
-
-            #[cfg(target_endian = "big")]
-            type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LitteEndian Inner>];
+            cfg_select! {
+                target_endian = "little" => {
+                    type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LittleEndian Inner>];
+                    type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
+                }
+                target_endian = "big" => {
+                    type [<$signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count BigEndian Inner>];
+                    type [<Flipped $signed_prefix $bit_count Inner>] = [<$signed_prefix $bit_count LittleEndian Inner>];
+                }
+            }
 
 
             #[allow(non_camel_case_types)]
@@ -418,20 +445,18 @@ macro_rules! nbyte_int_inner {
             unsafe impl bytemuck::Zeroable for [<$signed_prefix:lower $bit_count>] {}
 
             impl [<$signed_prefix:lower $bit_count>] {
-                const DATA_BITS_MASK: $backing_ty = (1 << ($byte_count * 8)) - 1;
+                const DATA_BITS_MASK: $backing_ty = (1 as $backing_ty)
+                    .strict_shl($bit_count)
+                    .strict_sub(1);
 
                 const MIN_INNER: $backing_ty = match_signedness! {
                     match $signed_prefix {
                         SIGNED => {
                             {
-                                // FIXME (isolate_most_significant_one)
-                                // just the sign bit; but sadly this is not a negative value
-                                // in the underlying type
-                                let abs_value = (Self::DATA_BITS_MASK + 1) >> 1;
+                                let abs_value = Self::DATA_BITS_MASK.isolate_highest_one();
                                 // in twos compliment the sign bit = -expected value
                                 // so if we negate its absolute value we get the minimum
-
-                                -abs_value
+                                abs_value.strict_neg()
                             }
                         },
                         UNSIGNED => { 0 },
@@ -447,48 +472,128 @@ macro_rules! nbyte_int_inner {
 
 
                 pub const BITS: u32 = $bit_count;
+
                 pub const MIN: Self = Self::new(Self::MIN_INNER).unwrap();
                 pub const MAX: Self = Self::new(Self::MAX_INNER).unwrap();
 
-                /// truncates the upper bytes and sets them to zero
+                #[doc = concat!(
+                    "Creates a [`", stringify!([<$signed_prefix:lower $bit_count>]), "`](struct@",
+                    stringify!([<$signed_prefix:lower $bit_count>]), ") from a `",
+                    stringify!($backing_ty), "`, returning [`None`] if the value does not fit in ",
+                    stringify!($bit_count), " bits.\n\n",
+                    "The valid range is [`MIN`](Self::MIN)`..=`[`MAX`](Self::MAX).\n\n",
+                    "This is the checked counterpart of [`new_unchecked`](Self::new_unchecked) ",
+                    "and [`new_truncated`](Self::new_truncated). It is `const`, so it can be used ",
+                    "to build constants; the type's constant macro does exactly that and panics ",
+                    "at compile time on failure.\n\n",
+                    "# Examples\n\n",
+                    "```\n",
+                    "use nbyte_int::prelude::*;\n\n",
+                    "assert_eq!(", stringify!([<$signed_prefix:lower $bit_count>]), "::new(0).map(|x| x.get()), Some(0));\n",
+                    "assert_eq!(", stringify!([<$signed_prefix:lower $bit_count>]), "::new(",
+                    stringify!([<$signed_prefix:lower $bit_count>]), "::MAX.get()).map(|x| x.get()), ",
+                    "Some(", stringify!([<$signed_prefix:lower $bit_count>]), "::MAX.get()));\n",
+                    "// one past the maximum does not fit\n",
+                    "assert!(", stringify!([<$signed_prefix:lower $bit_count>]), "::MAX.get().checked_add(1)",
+                    ".and_then(", stringify!([<$signed_prefix:lower $bit_count>]), "::new).is_none());\n",
+                    "```"
+                )]
                 #[inline(always)]
-                pub const fn new(bits: $backing_ty) -> Option<Self> {
-                    if Self::MIN_INNER <= bits && bits <= Self::MAX_INNER {
-                        return Some(match_signedness! {
-                            match $signed_prefix {
-                                // the sign bit and friends may be on
-                                // mask it just in case
-                                SIGNED => { Self::new_truncated(bits) },
-                                // unsigned no need to mask the top bits
-                                // they are already off
-                                UNSIGNED => { unsafe { Self::from_bits(bits) } },
-                            }
-                        })
+                pub const fn new(x: $backing_ty) -> Option<Self> {
+                    match x {
+                        Self::MIN_INNER..=Self::MAX_INNER => Some(unsafe { Self::new_unchecked(x) }),
+                        _ => None
                     }
-
-                    None
                 }
 
+                #[doc = concat!(
+                    "Creates a [`", stringify!([<$signed_prefix:lower $bit_count>]), "`](struct@",
+                    stringify!([<$signed_prefix:lower $bit_count>]), ") from a `",
+                    stringify!($backing_ty), "` without checking that it fits in ",
+                    stringify!($bit_count), " bits.\n\n",
+                    "Prefer [`new`](Self::new) (checked) or [`new_truncated`](Self::new_truncated) ",
+                    "(wrapping) unless the range check is provably redundant and measurably matters.\n\n",
+                    "# Safety\n\n",
+                    "`x` must be within [`MIN`](Self::MIN)`..=`[`MAX`](Self::MAX), i.e. the value ",
+                    "[`new`](Self::new) would accept. Violating this is immediate UB",
+                )]
+                #[inline(always)]
+                pub const unsafe fn new_unchecked(x: $backing_ty) -> Self {
+                    unsafe {
+                        core::hint::assert_unchecked(Self::MIN_INNER <= x);
+                        core::hint::assert_unchecked(x <= Self::MAX_INNER);
+                    }
+
+                    match_signedness! {
+                        match $signed_prefix {
+                            // the sign bit and friends may be on so mask it just in case
+                            SIGNED => { Self::new_truncated(x) },
+                            // unsigned no need to mask the top bits since they are already off
+                            UNSIGNED => { unsafe { Self::from_bits(x) } },
+                        }
+                    }
+                }
+
+                #[doc = concat!(
+                    "Creates a ",
+                    $byte_count,
+                    "-byte integer from its exact raw bit pattern, bypassing all masking."
+                )]
+                ///
+                /// Unlike [`new_unchecked`](Self::new_unchecked), which takes a logical integer value
+                /// and handles any necessary sign-bit masking, this transmutes the bits directly.
+                /// Only use it when you already have a pre-masked bit pattern matching the
+                /// type's exact internal representation.
+                ///
                 /// # Safety
                 #[doc = concat!(
-                    "the number must only have the first ",
+                    "Only the low ",
                     $byte_count,
-                    " with zeros, the upper bytes must NOT be filled"
+                    " bytes of `bits` may be non-zero. The upper bytes must all be zero. ",
+                    "Violating this is immediate undefined behavior (UB)."
                 )]
                 #[inline(always)]
                 pub const unsafe fn from_bits(bits: $backing_ty) -> Self {
                     // Safety: upheld by user
-                    unsafe { core::mem::transmute(bits) }
-                }
-
-                /// truncates the upper bytes and sets them to zero
-                #[inline(always)]
-                pub const fn new_truncated(bits: $backing_ty) -> Self {
                     unsafe {
-                        Self::from_bits(bits & Self::DATA_BITS_MASK)
+                        core::hint::assert_unchecked(bits & const { !Self::DATA_BITS_MASK } == 0);
+                        core::mem::transmute(bits)
                     }
                 }
 
+                #[doc = concat!(
+                    "Creates a ",
+                    $byte_count,
+                    "-byte integer by truncating the upper bits of the provided value."
+                )]
+                ///
+                /// This applies a bitmask to clear any bits outside the target bit-width.
+                /// This behaves identically to primitive narrowing casts (e.g., `u32 as u16`),
+                /// where values out of bounds wrap around.
+                ///
+                /// Unlike [`new`](Self::new), this method will not return `None` on overflow.
+                /// Unlike [`new_unchecked`](Self::new_unchecked) or [`from_bits`](Self::from_bits),
+                /// this method is always safe to call with any value because it strictly enforces
+                /// the memory layout invariants via masking.
+                #[inline(always)]
+                pub const fn new_truncated(bits: $backing_ty) -> Self {
+                    unsafe { Self::from_bits(bits & Self::DATA_BITS_MASK) }
+                }
+
+                #[doc = concat!(
+                    "Returns the raw bit pattern of the ",
+                    $byte_count,
+                    "-byte integer as its underlying backing type."
+                )]
+                ///
+                /// This returns the exact memory representation of the integer where the upper
+                /// padding bytes are guaranteed to be zero.
+                ///
+                /// **Warning on Signed Integers:** This method does *not* perform sign extension.
+                /// If you call `to_bits()` on a negative value, the returned backing primitive
+                /// will have its upper bytes set to `0`, which will change its logical value.
+                ///
+                /// To retrieve the logical value with proper sign extension, always use [`get`](Self::get) instead.
                 #[inline(always)]
                 pub const fn to_bits(self) -> $backing_ty {
                     // Safety: self is always in the same layout as backing
@@ -496,18 +601,17 @@ macro_rules! nbyte_int_inner {
                 }
 
                 #[inline(always)]
-                pub const fn swapped_bytes(self) -> [u8; $byte_count] {
+                const fn get_swapped_bytes_inner(self) -> [u8; $byte_count] {
                     let bits = self.to_bits();
                     let swapped = bits.swap_bytes();
 
                     // Safety:
-                    // swapped just swaps the bytes and so is a valid
-                    // flipped version of self which is what
-                    // [<Flipped $byte_count IntInner>] is
+                    // swapped just swaps the bytes and so is a valid but flipped
+                    // version of self which is what [<Flipped $byte_count IntInner>] is
                     let swapped: [<Flipped $signed_prefix $bit_count Inner>] = unsafe {
                         core::mem::transmute(swapped)
                     };
-                    
+
                     swapped.bytes
                 }
 
@@ -515,33 +619,43 @@ macro_rules! nbyte_int_inner {
                 pub const fn swap_bytes(self) -> Self {
                     // this has surprisingly very good codegen
                     // and is as good if not better than anything manual after inlining
-                    Self::from_ne_bytes(self.swapped_bytes())
+                    Self::from_ne_bytes(self.get_swapped_bytes_inner())
+                }
+
+                #[inline(always)]
+                pub const fn from_le(x: Self) -> Self {
+                    #[cfg(target_endian = "little")]
+                    {
+                        x
+                    }
+
+                    #[cfg(target_endian = "big")]
+                    {
+                        x.swap_bytes()
+                    }
+                }
+
+                #[inline(always)]
+                pub const fn from_be(x: Self) -> Self {
+                    #[cfg(target_endian = "big")]
+                    {
+                        x
+                    }
+
+                    #[cfg(target_endian = "little")]
+                    {
+                        x.swap_bytes()
+                    }
                 }
 
                 #[inline(always)]
                 pub const fn to_le(self) -> Self {
-                    #[cfg(target_endian = "little")]
-                    {
-                        self
-                    }
-
-                    #[cfg(target_endian = "big")]
-                    {
-                        self.swap_bytes()
-                    }
+                    Self::from_le(self)
                 }
 
                 #[inline(always)]
                 pub const fn to_be(self) -> Self {
-                    #[cfg(target_endian = "big")]
-                    {
-                        self
-                    }
-
-                    #[cfg(target_endian = "little")]
-                    {
-                        self.swap_bytes()
-                    }
+                    Self::from_be(self)
                 }
 
                 #[inline(always)]
@@ -554,12 +668,12 @@ macro_rules! nbyte_int_inner {
 
                 #[inline(always)]
                 pub const fn from_le_bytes(bytes: [u8; $byte_count]) -> Self {
-                    Self::from_ne_bytes(bytes).to_le()
+                    Self::from_le(Self::from_ne_bytes(bytes))
                 }
 
                 #[inline(always)]
                 pub const fn from_be_bytes(bytes: [u8; $byte_count]) -> Self {
-                    Self::from_ne_bytes(bytes).to_be()
+                    Self::from_be(Self::from_ne_bytes(bytes))
                 }
 
                 #[inline(always)]
@@ -576,7 +690,7 @@ macro_rules! nbyte_int_inner {
 
                     #[cfg(target_endian = "big")]
                     {
-                        self.swapped_bytes()
+                        self.get_swapped_bytes_inner()
                     }
                 }
 
@@ -589,25 +703,42 @@ macro_rules! nbyte_int_inner {
 
                     #[cfg(target_endian = "little")]
                     {
-                        self.swapped_bytes()
+                        self.get_swapped_bytes_inner()
                     }
                 }
 
+                #[doc = concat!(
+                    "Returns the logical value of the ",
+                    $byte_count,
+                    "-byte integer as its underlying `",
+                    stringify!($backing_ty),
+                    "` backing type."
+                )]
+                ///
+                /// For signed integers, this method performs proper sign extension. This ensures
+                /// that negative values correctly retain their negative logical value when cast
+                /// up to the wider backing primitive. For unsigned integers, the value is simply
+                /// zero-extended.
+                ///
+                /// If you need the raw, unextended memory layout (where the upper padding bytes
+                /// are strictly zeroed out regardless of sign), use [`to_bits`](Self::to_bits) instead.
                 #[inline(always)]
                 pub const fn get(self) -> $backing_ty {
                     match_signedness! {
                         match $signed_prefix {
                             SIGNED => {
                                 {
-                                    const OFFSET: u32 = $backing_ty::BITS - <[<$signed_prefix:lower $bit_count>]>::BITS;
-                                    // FIXME unchecked_shifts
+                                    const OFFSET: u32 = $backing_ty::BITS
+                                        .strict_sub(<[<$signed_prefix:lower $bit_count>]>::BITS);
+
+                                    let bits = self.to_bits();
                                     // this aligns the integers sign bit
                                     // to the sign bit of the backing type
                                     // and then sign extends backwards
-                                    (self.to_bits() << OFFSET) >> OFFSET
+                                    unsafe { bits.unchecked_shl(OFFSET).unchecked_shr(OFFSET) }
                                 }
                             },
-                            // if the data is not signed no special handling is required
+                            // if the data is not signed; no special handling is required
                             UNSIGNED => { self.to_bits() },
                         }
                     }
@@ -624,13 +755,17 @@ macro_rules! nbyte_int_inner {
             $($(
                 #[macro_export]
                 macro_rules! [<$signed_prefix:lower $bit_count>] {
-                    ($__inner_expr__: expr) => {
+                    ($__inner_expr__: literal) => {
                         const {
                             match $crate::types::[<$signed_prefix:lower $bit_count>]::new($__inner_expr__) {
                                 Some(x) => x,
-                                None => panic!(
-                                    concat!("invalid number constant")
-                                )
+                                None => panic!(concat!(
+                                    "invalid ",
+                                    stringify!([<$signed_prefix:lower $bit_count>]),
+                                    " literal `",
+                                    $__inner_expr__,
+                                    "`"
+                                ))
                             }
                         }
                     }

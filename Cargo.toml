@@ -5,15 +5,16 @@ edition = "2024"
 repository = "https://github.com/vrtgs/nbyte-int"
 license = "MIT OR Apache-2.0"
 description = "any byte sized increment of a number"
+rust-version = "1.97.0"
 
 [features]
 default = []
 
 [dependencies]
-bytemuck = { version = "1.23.2", optional = true }
+bytemuck = { version = "1.25.2", optional = true }
 num-traits = { version = "0.2.19", optional = true }
-serde = { version = "1.0.228", optional = true }
-pastey = "0.1.1"
+serde = { version = "1.0.229", optional = true }
+pastey = "0.2.3"
 
 
 [dev-dependencies]
