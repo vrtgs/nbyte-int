@@ -752,9 +752,31 @@ macro_rules! nbyte_int_inner {
 
 
         pub mod const_macro {
+            //! Compile-time checked constructors, one macro per type (`i24!`, `u40!`, ...).
+            //!
+            //! They live here instead of the crate root so they don't clutter it.
+
+            #[cfg(doc)]
+            use crate::types::*;
+
             $($(
                 #[macro_export]
-                macro_rules! [<$signed_prefix:lower $bit_count>] {
+                #[doc = concat!(
+                    "Creates a [`", stringify!([<$signed_prefix:lower $bit_count>]), "`](struct@", stringify!([<$signed_prefix:lower $bit_count>]), ") from an integer literal, ",
+                    "checked at compile time.\n\n",
+                    "Fails to compile if the literal is outside [`MIN`](", stringify!([<$signed_prefix:lower $bit_count>]), "::MIN)`..=`",
+                    "[`MAX`](", stringify!([<$signed_prefix:lower $bit_count>]), "::MAX). Only literals are accepted; for other constant ",
+                    "expressions use `const { ", stringify!([<$signed_prefix:lower $bit_count>]), "::new(expr).unwrap() }`.\n\n",
+                    "# Examples\n\n",
+                    "```\n",
+                    "use nbyte_int::const_macro::", stringify!([<$signed_prefix:lower $bit_count>]), ";\n\n",
+                    "const X: nbyte_int::types::", stringify!([<$signed_prefix:lower $bit_count>]), " = ", stringify!([<$signed_prefix:lower $bit_count>]), "!(1);\n",
+                    "assert_eq!(X.get(), 1);\n",
+                    "```\n\n",
+                    "An out-of-range literal is a compile error.",
+                )]
+                #[doc(hidden)]
+                macro_rules! [<__ $signed_prefix:lower $bit_count __>] {
                     ($__inner_expr__: literal) => {
                         const {
                             match $crate::types::[<$signed_prefix:lower $bit_count>]::new($__inner_expr__) {
@@ -771,7 +793,8 @@ macro_rules! nbyte_int_inner {
                     }
                 }
 
-                pub use [<$signed_prefix:lower $bit_count>];
+                #[doc(inline)]
+                pub use [<__ $signed_prefix:lower $bit_count __>] as [<$signed_prefix:lower $bit_count>];
             )*)*
         }
         }
